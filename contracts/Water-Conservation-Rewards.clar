@@ -14,6 +14,14 @@
 (define-constant err-transfer-restricted (err u111))
 
 
+(define-constant err-leaderboard-disabled (err u112))
+(define-constant err-already-opted-in (err u113))
+(define-constant err-not-opted-in (err u114))
+
+(define-data-var leaderboard-enabled bool true)
+(define-data-var max-leaderboard-size uint u50)
+
+
 (define-data-var reward-pool uint u0)
 (define-data-var base-reward uint u100)
 (define-data-var registration-fee uint u10)
@@ -296,3 +304,84 @@
   (default-to u0 (map-get? user-conservation-streak user)))
 
 (initialize-badges)
+
+
+(define-map leaderboard-participants principal {
+  opted-in: bool,
+  total-conservation-score: uint,
+  periods-participated: uint,
+  last-update-period: uint
+})
+
+(define-map period-leaderboard {period: uint, rank: uint} {
+  user: principal,
+  conservation-score: uint,
+  water-saved-percentage: uint
+})
+
+(define-map leaderboard-rankings uint principal)
+
+(define-public (opt-into-leaderboard)
+  (let ((user tx-sender))
+    (asserts! (var-get leaderboard-enabled) err-leaderboard-disabled)
+    (asserts! (is-user-registered user) err-not-registered)
+    (asserts! (is-none (map-get? leaderboard-participants user)) err-already-opted-in)
+    (map-set leaderboard-participants user {
+      opted-in: true,
+      total-conservation-score: u0,
+      periods-participated: u0,
+      last-update-period: u0
+    })
+    (ok true)))
+
+(define-public (opt-out-of-leaderboard)
+  (let ((user tx-sender))
+    (asserts! (is-some (map-get? leaderboard-participants user)) err-not-opted-in)
+    (map-delete leaderboard-participants user)
+    (ok true)))
+
+(define-private (update-leaderboard-score (user principal) (period uint))
+  (let ((participant-data (map-get? leaderboard-participants user)))
+    (match participant-data data
+      (let (
+        (user-data (unwrap-panic (map-get? users user)))
+        (usage-data (unwrap-panic (map-get? user-usage {user: user, period: period})))
+        (threshold (get water-threshold user-data))
+        (actual (get actual-usage usage-data))
+        (saved-percentage (if (> threshold u0) 
+          (/ (* (- threshold actual) u100) threshold) u0))
+        (conservation-score (+ saved-percentage 
+          (if (>= (get streak-length (default-to {streak-length: u0} 
+            (map-get? user-badges {user: user, badge-type: u1}))) u3) u20 u0)))
+      )
+        (map-set leaderboard-participants user {
+          opted-in: true,
+          total-conservation-score: (+ (get total-conservation-score data) conservation-score),
+          periods-participated: (+ (get periods-participated data) u1),
+          last-update-period: period
+        })
+        (ok conservation-score))
+      (ok u0))))
+
+(define-read-only (get-leaderboard (limit uint))
+  (let ((actual-limit (if (> limit (var-get max-leaderboard-size)) 
+    (var-get max-leaderboard-size) limit)))
+    (map get-leaderboard-entry (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10))))
+
+(define-private (get-leaderboard-entry (rank uint))
+  (map-get? leaderboard-rankings rank))
+
+(define-read-only (get-user-leaderboard-stats (user principal))
+  (map-get? leaderboard-participants user))
+
+(define-read-only (get-conservation-achievements (user principal))
+  (let ((participant-data (map-get? leaderboard-participants user)))
+    (match participant-data data
+      {
+        opted-in: true,
+        average-score: (if (> (get periods-participated data) u0)
+          (/ (get total-conservation-score data) (get periods-participated data)) u0),
+        total-score: (get total-conservation-score data),
+        periods: (get periods-participated data)
+      }
+      {opted-in: false, average-score: u0, total-score: u0, periods: u0})))
