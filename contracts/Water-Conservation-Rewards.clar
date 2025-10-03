@@ -18,6 +18,9 @@
 (define-constant err-already-opted-in (err u113))
 (define-constant err-not-opted-in (err u114))
 
+(define-constant err-goal-not-active (err u115))
+(define-constant err-insufficient-bonus-pool (err u116))
+
 (define-data-var leaderboard-enabled bool true)
 (define-data-var max-leaderboard-size uint u50)
 
@@ -385,3 +388,82 @@
         periods: (get periods-participated data)
       }
       {opted-in: false, average-score: u0, total-score: u0, periods: u0})))
+
+
+(define-map community-goals uint {
+  target-water-saved: uint,
+  actual-water-saved: uint,
+  bonus-pool: uint,
+  goal-active: bool,
+  participants-count: uint,
+  goal-achieved: bool
+})
+
+(define-map user-goal-contribution {user: principal, period: uint} {
+  water-saved: uint,
+  bonus-claimed: bool,
+  contribution-percentage: uint
+})
+
+(define-data-var community-bonus-multiplier uint u50)
+
+(define-public (set-community-goal (period uint) (target-saved uint) (bonus-amount uint))
+  (begin
+    (asserts! (is-contract-owner) err-owner-only)
+    (asserts! (> target-saved u0) err-invalid-threshold)
+    (asserts! (>= (var-get reward-pool) bonus-amount) err-insufficient-balance)
+    (var-set reward-pool (- (var-get reward-pool) bonus-amount))
+    (map-set community-goals period {
+      target-water-saved: target-saved,
+      actual-water-saved: u0,
+      bonus-pool: bonus-amount,
+      goal-active: true,
+      participants-count: u0,
+      goal-achieved: false
+    })
+    (ok true)))
+
+(define-public (record-conservation-contribution (user principal) (period uint))
+  (let (
+    (user-data (unwrap! (map-get? users user) err-not-registered))
+    (usage-data (unwrap! (map-get? user-usage {user: user, period: period}) err-not-eligible))
+    (goal-data (unwrap! (map-get? community-goals period) err-goal-not-active))
+    (threshold (get water-threshold user-data))
+    (actual (get actual-usage usage-data))
+    (water-saved (if (> threshold actual) (- threshold actual) u0))
+  )
+    (asserts! (get goal-active goal-data) err-goal-not-active)
+    (asserts! (<= actual threshold) err-not-eligible)
+    (map-set user-goal-contribution {user: user, period: period} {
+      water-saved: water-saved,
+      bonus-claimed: false,
+      contribution-percentage: u0
+    })
+    (map-set community-goals period (merge goal-data {
+      actual-water-saved: (+ (get actual-water-saved goal-data) water-saved),
+      participants-count: (+ (get participants-count goal-data) u1)
+    }))
+    (ok water-saved)))
+
+(define-public (claim-community-bonus (period uint))
+  (let (
+    (user tx-sender)
+    (goal-data (unwrap! (map-get? community-goals period) err-goal-not-active))
+    (contribution (unwrap! (map-get? user-goal-contribution {user: user, period: period}) err-not-eligible))
+    (total-saved (get actual-water-saved goal-data))
+    (user-saved (get water-saved contribution))
+    (bonus-pool (get bonus-pool goal-data))
+    (user-share (if (> total-saved u0) (/ (* bonus-pool user-saved) total-saved) u0))
+  )
+    (asserts! (>= total-saved (get target-water-saved goal-data)) err-not-eligible)
+    (asserts! (not (get bonus-claimed contribution)) err-reward-already-claimed)
+    (asserts! (> user-share u0) err-insufficient-balance)
+    (map-set user-goal-contribution {user: user, period: period} (merge contribution {bonus-claimed: true}))
+    (try! (as-contract (stx-transfer? user-share tx-sender user)))
+    (ok user-share)))
+
+(define-read-only (get-community-goal-status (period uint))
+  (map-get? community-goals period))
+
+(define-read-only (get-user-contribution (user principal) (period uint))
+  (map-get? user-goal-contribution {user: user, period: period}))
