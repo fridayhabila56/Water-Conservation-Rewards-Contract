@@ -467,3 +467,100 @@
 
 (define-read-only (get-user-contribution (user principal) (period uint))
   (map-get? user-goal-contribution {user: user, period: period}))
+
+
+(define-constant err-invalid-referrer (err u117))
+(define-constant err-self-referral (err u118))
+(define-constant err-referral-bonus-claimed (err u119))
+
+(define-data-var referral-bonus-percentage uint u10)
+(define-data-var network-bonus-percentage uint u5)
+
+(define-map user-referrals principal {
+  referrer: (optional principal),
+  total-referrals: uint,
+  direct-network-size: uint,
+  total-referral-earnings: uint
+})
+
+(define-map period-referral-earnings {user: principal, period: uint} {
+  direct-bonus: uint,
+  network-bonus: uint,
+  bonus-claimed: bool,
+  qualifying-referrals: uint
+})
+
+(define-public (register-with-referral (threshold uint) (referrer (optional principal)))
+  (let ((user tx-sender))
+    (asserts! (> threshold u0) err-invalid-threshold)
+    (asserts! (is-none (map-get? users user)) err-already-registered)
+    (asserts! (>= (stx-get-balance user) (var-get registration-fee)) err-insufficient-balance)
+    (match referrer ref-principal
+      (begin
+        (asserts! (not (is-eq user ref-principal)) err-self-referral)
+        (asserts! (is-user-registered ref-principal) err-invalid-referrer)
+        (let ((ref-data (default-to 
+          {referrer: none, total-referrals: u0, direct-network-size: u0, total-referral-earnings: u0}
+          (map-get? user-referrals ref-principal))))
+          (map-set user-referrals ref-principal (merge ref-data {
+            total-referrals: (+ (get total-referrals ref-data) u1),
+            direct-network-size: (+ (get direct-network-size ref-data) u1)
+          }))))
+      true)
+    (try! (stx-transfer? (var-get registration-fee) user contract-owner))
+    (map-set users user {
+      registered: true,
+      water-threshold: threshold,
+      total-rewards: u0,
+      registration-block: stacks-block-height
+    })
+    (map-set user-referrals user {
+      referrer: referrer,
+      total-referrals: u0,
+      direct-network-size: u0,
+      total-referral-earnings: u0
+    })
+    (var-set reward-pool (+ (var-get reward-pool) (var-get registration-fee)))
+    (ok true)))
+
+(define-public (claim-referral-bonus (period uint))
+  (let (
+    (user tx-sender)
+    (referral-data (unwrap! (map-get? user-referrals user) err-not-registered))
+    (earnings-data (default-to 
+      {direct-bonus: u0, network-bonus: u0, bonus-claimed: false, qualifying-referrals: u0}
+      (map-get? period-referral-earnings {user: user, period: period})))
+    (total-bonus (+ (get direct-bonus earnings-data) (get network-bonus earnings-data))))
+    (asserts! (not (get bonus-claimed earnings-data)) err-referral-bonus-claimed)
+    (asserts! (> total-bonus u0) err-insufficient-balance)
+    (map-set period-referral-earnings {user: user, period: period} (merge earnings-data {bonus-claimed: true}))
+    (map-set user-referrals user (merge referral-data {
+      total-referral-earnings: (+ (get total-referral-earnings referral-data) total-bonus)
+    }))
+    (try! (as-contract (stx-transfer? total-bonus tx-sender user)))
+    (ok total-bonus)))
+
+(define-public (process-referral-rewards (referred-user principal) (period uint) (reward-amount uint))
+  (let ((referral-data (map-get? user-referrals referred-user)))
+    (match referral-data ref-info
+      (match (get referrer ref-info) referrer-principal
+        (let (
+          (direct-bonus (/ (* reward-amount (var-get referral-bonus-percentage)) u100))
+          (current-earnings (default-to 
+            {direct-bonus: u0, network-bonus: u0, bonus-claimed: false, qualifying-referrals: u0}
+            (map-get? period-referral-earnings {user: referrer-principal, period: period}))))
+          (map-set period-referral-earnings {user: referrer-principal, period: period} {
+            direct-bonus: (+ (get direct-bonus current-earnings) direct-bonus),
+            network-bonus: (get network-bonus current-earnings),
+            bonus-claimed: false,
+            qualifying-referrals: (+ (get qualifying-referrals current-earnings) u1)
+          })
+          (ok true))
+        (ok false))
+      (ok false))))
+
+(define-read-only (get-referral-stats (user principal))
+  (map-get? user-referrals user))
+
+(define-read-only (get-referral-earnings (user principal) (period uint))
+  (map-get? period-referral-earnings {user: user, period: period}))
